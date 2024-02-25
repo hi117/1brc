@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -22,7 +23,7 @@ type Line struct {
 	Value int64
 }
 
-var Stations = make([]Station, 10000)
+var Stations []Station
 
 func open() (mmap.MMap, int64, error) {
 	f, err := os.OpenFile("./measurements.txt", os.O_RDONLY, 0644)
@@ -74,30 +75,29 @@ func readLine(rawMap mmap.MMap, offset int64) (Line, int64) {
 	}
 }
 
-/*
-func insertLine(line Line) {
-	for i := range Stations {
-		if Stations[i].Name != nil && bytes.Equal(Stations[i].Name, line.Name) {
-			Stations[i].Count += 1
-			if Stations[i].Max < line.Value {
-				Stations[i].Max = line.Value
+func insertLine(cpu int64, line Line) {
+	cpuStations := Stations[cpu*10000 : (cpu+1)*10000]
+	for i := range cpuStations {
+		if cpuStations[i].Name != nil && bytes.Equal(cpuStations[i].Name, line.Name) {
+			cpuStations[i].Count += 1
+			if cpuStations[i].Max < line.Value {
+				cpuStations[i].Max = line.Value
 			}
-			if Stations[i].Min > line.Value {
-				Stations[i].Min = line.Value
+			if cpuStations[i].Min > line.Value {
+				cpuStations[i].Min = line.Value
 			}
-			Stations[i].Sum += line.Value
+			cpuStations[i].Sum += line.Value
 			return
-		} else if Stations[i].Name == nil {
-			Stations[i].Name = line.Name
-			Stations[i].Count = 1
-			Stations[i].Max = line.Value
-			Stations[i].Min = line.Value
-			Stations[i].Sum = line.Value
+		} else if cpuStations[i].Name == nil {
+			cpuStations[i].Name = line.Name
+			cpuStations[i].Count = 1
+			cpuStations[i].Max = line.Value
+			cpuStations[i].Min = line.Value
+			cpuStations[i].Sum = line.Value
 			return
 		}
 	}
 }
-*/
 
 func main() {
 	f, err := os.Create("prof.out")
@@ -118,6 +118,7 @@ func main() {
 
 	cpus := int64(runtime.NumCPU())
 	chunkSize := size / cpus
+	Stations = make([]Station, cpus*10000)
 
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -145,7 +146,9 @@ func main() {
 			}
 
 			for start < end {
-				_, start = readLine(rawMap, start)
+				var line Line
+				line, start = readLine(rawMap, start)
+				insertLine(i, line)
 			}
 			wg.Done()
 		}(int64(i))
@@ -153,4 +156,31 @@ func main() {
 
 	wg.Wait()
 	log.Info().Dur("time", time.Since(start)).Msg("Finished reading the data")
+	start = time.Now()
+
+	baseStations := Stations[:10000]
+	for i := range cpus - 1 {
+		i += 1
+		cpuStations := Stations[i*10000 : (i+1)*10000]
+		for _, station := range cpuStations {
+			if station.Name == nil {
+				break
+			}
+			for j := range baseStations {
+				if baseStations[j].Name == nil {
+					baseStations[j] = station
+				} else if bytes.Equal(baseStations[j].Name, station.Name) {
+					baseStations[j].Sum += station.Sum
+					baseStations[j].Count += station.Count
+					if baseStations[j].Min > station.Min {
+						baseStations[j].Min = station.Min
+					}
+					if baseStations[j].Max < station.Max {
+						baseStations[j].Max = station.Max
+					}
+				}
+			}
+		}
+	}
+	log.Info().Dur("time", time.Since(start)).Msg("Finished merging the data")
 }
