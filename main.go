@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
-	"fmt"
 	"os"
+	"runtime"
 	"runtime/pprof"
-	"sort"
-	"strconv"
+	"sync"
 	"time"
 
 	"github.com/edsrzf/mmap-go"
@@ -15,13 +13,13 @@ import (
 )
 
 type Station struct {
-	Min, Max, Count, Sum, Average float64
+	Min, Max, Count, Sum, Average int64
 	Name                          []byte
 }
 
 type Line struct {
 	Name  []byte
-	Value float64
+	Value int64
 }
 
 var Stations = make([]Station, 10000)
@@ -42,33 +40,41 @@ func open() (mmap.MMap, int64, error) {
 	return mmap, stat.Size(), nil
 }
 
-func readLine(rawMap mmap.MMap, offset int64) (Line, int64, error) {
+func readLine(rawMap mmap.MMap, offset int64) (Line, int64) {
 	endOffset := offset
-	var err error
 	var ret Line
-	var search byte = ';'
-	var floatBegin int64
 	for {
-		if rawMap[endOffset] == search {
-			if search == ';' {
-				// Extract the name
-				ret.Name = rawMap[offset : endOffset-1]
-				search = '\n'
-				floatBegin = endOffset + 1
+		if rawMap[endOffset] == ';' {
+			// Extract the name
+			ret.Name = rawMap[offset:endOffset]
+			// Parse the value ints start at 0x30
+			negative := rawMap[endOffset+1] == '-'
+			var is2Digit bool
+			if negative {
+				is2Digit = rawMap[endOffset+4] == '.'
 			} else {
-				// Parse float
-				ret.Value, err = strconv.ParseFloat(string(rawMap[floatBegin:endOffset]), 64)
-				if err != nil {
-					return ret, endOffset, errors.WithStack(err)
-				}
-				break
+				is2Digit = rawMap[endOffset+3] == '.'
 			}
+			if is2Digit && negative {
+				ret.Value = (int64(rawMap[endOffset+2]-'0')*100 + int64(rawMap[endOffset+3]-'0')*10 + int64(rawMap[endOffset+5]-'0')) * -1
+				endOffset += 7
+			} else if is2Digit && !negative {
+				ret.Value = int64(rawMap[endOffset+1]-'0')*100 + int64(rawMap[endOffset+2]-'0')*10 + int64(rawMap[endOffset+4]-'0')
+				endOffset += 6
+			} else if negative {
+				ret.Value = (int64(rawMap[endOffset+2]-'0')*10 + int64(rawMap[endOffset+4]-'0')) * -1
+				endOffset += 6
+			} else {
+				ret.Value = int64(rawMap[endOffset+1]-'0')*10 + int64(rawMap[endOffset+3]-'0')
+				endOffset += 5
+			}
+			return ret, endOffset
 		}
 		endOffset += 1
 	}
-	return ret, endOffset, nil
 }
 
+/*
 func insertLine(line Line) {
 	for i := range Stations {
 		if Stations[i].Name != nil && bytes.Equal(Stations[i].Name, line.Name) {
@@ -91,6 +97,7 @@ func insertLine(line Line) {
 		}
 	}
 }
+*/
 
 func main() {
 	f, err := os.Create("prof.out")
@@ -109,69 +116,41 @@ func main() {
 	}
 	defer rawMap.Unmap()
 
-	var offset int64 = 0
-	var count int64 = 0
-	var start = time.Now()
-	var trueStart = start
-	var first bool
-	for offset < size {
-		var line Line
-		line, offset, err = readLine(rawMap, offset)
-		if err != nil {
-			log.Fatal().Err(err).Stack().Msg("Could not read line")
-		}
-		insertLine(line)
+	cpus := int64(runtime.NumCPU())
+	chunkSize := size / cpus
 
-		if count%1000000 == 0 {
-			log.Info().Int64("count", count).Dur("time", time.Since(start)).Msg("Reading file")
-			start = time.Now()
-			if first {
-				break
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := range cpus {
+		wg.Add(1)
+		go func(i int64) {
+			start := i * chunkSize
+			end := (i + 1) * chunkSize
+
+			// Seek start and end until we align with a new data piece
+			for {
+				if rawMap[end] == '\n' {
+					break
+				}
+				end += 1
 			}
-			first = true
-		}
-		count += 1
-	}
-	log.Info().Dur("time", time.Since(trueStart)).Msg("Finished reading the data")
+			if start != 0 {
+				for {
+					if rawMap[start] == '\n' {
+						start += 1
+						break
+					}
+					start += 1
+				}
+			}
 
-	for i, v := range Stations {
-		if v.Name != nil {
-			log.Debug().Int("index", i).Interface("value", v).Msg("Station Value")
-		}
+			for start < end {
+				_, start = readLine(rawMap, start)
+			}
+			wg.Done()
+		}(int64(i))
 	}
 
-	trueStart = time.Now()
-	// Find the end
-	end := 0
-	for i := range Stations {
-		if Stations[i].Name == nil {
-			end = i
-			break
-		}
-	}
-	Stations = Stations[:end+1]
-
-	// Now sort the new slice
-	sort.Slice(Stations, func(i, j int) bool {
-		if Stations[i].Name == nil {
-			return false
-		}
-		return bytes.Compare(Stations[i].Name, Stations[j].Name) < 0
-	})
-	log.Info().Dur("time", time.Since(trueStart)).Msg("Finished sorting the data")
-
-	trueStart = time.Now()
-	for i := range Stations {
-		if Stations[i].Name == nil {
-			break
-		}
-		fmt.Printf("%s=%0.1f/%0.1f/%0.1f, ", string(Stations[i].Name), Stations[i].Min, Stations[i].Sum/Stations[i].Count, Stations[i].Max)
-	}
-	log.Info().Dur("time", time.Since(trueStart)).Msg("Finished printing the data")
-
-	for i, v := range Stations {
-		if v.Name != nil {
-			log.Debug().Int("index", i).Interface("value", v).Msg("Station Value")
-		}
-	}
+	wg.Wait()
+	log.Info().Dur("time", time.Since(start)).Msg("Finished reading the data")
 }
