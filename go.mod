@@ -1,4 +1,4 @@
-module github.com/hi117/1BillionRowChallenge
+module github.com/hi117/1brc
 
 go 1.22.0
 
