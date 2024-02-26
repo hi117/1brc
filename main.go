@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -14,14 +16,137 @@ import (
 
 type Station struct {
 	Min, Max, Count, Sum, Average int64
+	Name                          []byte
 }
+
+type StationsEntry struct {
+	Stations []Station
+	Count    int64
+}
+
+const StationsEntrySize = 16384 // 2^14
+const StationsEntryLog = 14
+
+func (s *StationsEntry) insertLine(line Line) {
+	index := int64(StationsEntrySize / 2)
+
+	var cmp int64
+	for curDepth := StationsEntryLog; curDepth >= 0; curDepth-- {
+		cmp = compare(line.Name, s.Stations[index].Name)
+		// We found the entry
+		if cmp == 0 {
+			s.Stations[index].Sum += line.Value
+			s.Stations[index].Count += 1
+			if s.Stations[index].Min > line.Value {
+				s.Stations[index].Min = line.Value
+			}
+			if s.Stations[index].Max < line.Value {
+				s.Stations[index].Max = line.Value
+			}
+			return
+		}
+		// go down left tree
+		if cmp == -1 {
+			if curDepth != 1 {
+				index -= StationsEntrySize >> (StationsEntryLog - (curDepth - 2))
+			} else {
+				index -= 1
+			}
+		}
+		// go down right tree
+		if cmp == 1 {
+			if curDepth > 1 {
+				index += StationsEntrySize >> (StationsEntryLog - (curDepth - 2))
+			} else {
+				index += 1
+			}
+		}
+	}
+	if s.Count != 0 {
+		for i := s.Count; i != index; i-- {
+			s.Stations[i] = s.Stations[i-1]
+		}
+	}
+	s.Stations[index] = Station{
+		Name:  line.Name,
+		Sum:   line.Value,
+		Count: 1,
+		Min:   line.Value,
+		Max:   line.Value,
+	}
+	s.Count += 1
+}
+
+func (s *StationsEntry) insertStation(station Station) {
+	index := int64(StationsEntrySize / 2)
+
+	var cmp int64
+	for curDepth := StationsEntryLog; curDepth >= 0; curDepth-- {
+		cmp = compare(station.Name, s.Stations[index].Name)
+		// We found the entry
+		if cmp == 0 {
+			s.Stations[index].Sum += station.Sum
+			s.Stations[index].Count += station.Count
+			if s.Stations[index].Min > station.Min {
+				s.Stations[index].Min = station.Min
+			}
+			if s.Stations[index].Max < station.Max {
+				s.Stations[index].Max = station.Max
+			}
+			return
+		}
+		// go down left tree
+		if cmp == -1 {
+			if curDepth != 1 {
+				index -= StationsEntrySize >> (StationsEntryLog - (curDepth - 2))
+			} else {
+				index -= 1
+			}
+		}
+		// go down right tree
+		if cmp == 1 {
+			if curDepth > 1 {
+				index += StationsEntrySize >> (StationsEntryLog - (curDepth - 2))
+			} else {
+				index += 1
+			}
+		}
+	}
+	if s.Count != 0 {
+		for i := s.Count; i != index; i-- {
+			s.Stations[i] = s.Stations[i-1]
+		}
+	}
+	s.Stations[index] = Station{
+		Name:  station.Name,
+		Sum:   station.Sum,
+		Count: station.Count,
+		Min:   station.Min,
+		Max:   station.Max,
+	}
+	s.Count += 1
+}
+
+func compare(a, b []byte) int64 {
+	// Same as compare but puts nulls on the right (-1)
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return 1
+	}
+	if b == nil {
+		return -1
+	}
+	return int64(bytes.Compare(a, b))
+}
+
+var Stations []StationsEntry
 
 type Line struct {
 	Name  []byte
 	Value int64
 }
-
-var Stations []map[string]Station
 
 func open() (mmap.MMap, int64, error) {
 	f, err := os.OpenFile("./measurements.txt", os.O_RDONLY, 0644)
@@ -73,30 +198,6 @@ func readLine(rawMap mmap.MMap, offset int64) (Line, int64) {
 	}
 }
 
-func insertLine(cpu int64, line Line) {
-	name := string(line.Name)
-	_, ok := Stations[cpu][name]
-	if !ok {
-		Stations[cpu][name] = Station{
-			Count: 1,
-			Max:   line.Value,
-			Min:   line.Value,
-			Sum:   line.Value,
-		}
-	} else {
-		station := Stations[cpu][name]
-		station.Count += 1
-		if station.Max < line.Value {
-			station.Max = line.Value
-		}
-		if station.Min > line.Value {
-			station.Min = line.Value
-		}
-		station.Sum += line.Value
-		Stations[cpu][name] = station
-	}
-}
-
 func main() {
 	f, err := os.Create("prof.out")
 	if err != nil {
@@ -114,11 +215,12 @@ func main() {
 	}
 	defer rawMap.Unmap()
 
-	cpus := int64(runtime.NumCPU())
+	cpus := int64(runtime.NumCPU()) * 2
+	//cpus := int64(1)
 	chunkSize := size / cpus
-	Stations = make([]map[string]Station, cpus)
+	Stations = make([]StationsEntry, cpus)
 	for i := range cpus {
-		Stations[i] = make(map[string]Station)
+		Stations[i].Stations = make([]Station, StationsEntrySize)
 	}
 
 	var wg sync.WaitGroup
@@ -128,6 +230,9 @@ func main() {
 		go func(i int64) {
 			start := i * chunkSize
 			end := (i + 1) * chunkSize
+			if end >= size {
+				end = size - 1
+			}
 
 			// Seek start and end until we align with a new data piece
 			for {
@@ -149,7 +254,7 @@ func main() {
 			for start < end {
 				var line Line
 				line, start = readLine(rawMap, start)
-				insertLine(i, line)
+				Stations[i].insertLine(line)
 			}
 			wg.Done()
 		}(int64(i))
@@ -162,23 +267,24 @@ func main() {
 	baseStations := Stations[0]
 	for i := range cpus - 1 {
 		i += 1
-		cpuStations := Stations[i]
-		for name, station := range cpuStations {
-			baseStation, ok := baseStations[name]
-			if !ok {
-				baseStations[name] = station
-			} else {
-				baseStation.Count += station.Count
-				baseStation.Sum += station.Sum
-				if baseStation.Min > station.Min {
-					baseStation.Min = station.Min
-				}
-				if baseStation.Max < station.Max {
-					baseStation.Max = station.Max
-				}
-				baseStations[name] = baseStation
-			}
+		for j := range Stations[i].Count {
+			baseStations.insertStation(Stations[i].Stations[j])
 		}
 	}
 	log.Info().Dur("time", time.Since(start)).Msg("Finished merging the data")
+
+	start = time.Now()
+	os.Stdout.Write([]byte{'{'})
+	for i := range baseStations.Count {
+		os.Stdout.Write(baseStations.Stations[i].Name)
+		fmt.Printf("=%0.1f/%0.1f/%0.1f",
+			float64(baseStations.Stations[i].Min)/10,
+			(float64(baseStations.Stations[i].Sum)/10)/(float64(baseStations.Stations[i].Count)/10),
+			float64(baseStations.Stations[i].Max)/10)
+		if i+1 != baseStations.Count {
+			os.Stdout.Write([]byte{',', ' '})
+		}
+	}
+	os.Stdout.Write([]byte{'}'})
+	log.Info().Dur("time", time.Since(start)).Msg("Finished writing the data")
 }
